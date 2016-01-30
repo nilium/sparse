@@ -1,52 +1,145 @@
+// Package sparse implements a sparse definition parser.
+//
+// Sparse is effectively an attribute language parser, where the language resembles Quake 3 style shaders. For example:
+//
+//      textures/base/wall_arc_01 {
+//              { # unit
+//                      map textures/base/wall_arc_01.tga
+//              }
+//              {
+//                      map textures/base/wall_arc_01.glow.tga
+//                      blend add
+//              }
+//
+//              no-collision!
+//              depth lte
+//              alpha always
+//              grid
+//                      1     1     1 \
+//                      1     1     1 \
+//                      1     1     1
+//      }
+//
+// Which would yield the following Pieces (either via a Parser or calling Parse):
+//
+//      NodeEnter("textures/base/wall_arc_01")
+//      NodeEnter(" unit")
+//      Comment(" unit") // If ReadComments(true)
+//      Field{"map", "textures/base/wall_arc_01.tga"}
+//      NodeLeave(2)
+//      NodeEnter()
+//      Field{"map", "textures/base/wall_arc_01.glow.tga"}
+//      Field{"blend", "add"}
+//      NodeLeave(2)
+//      Field{"no-collision", ""}
+//      Field{"depth", "lte"}
+//      Field{"alpha", "always"}
+//      Field{"grid", "1 1 1\n1 1 1\n1 1 1"
+//      NodeLeave(1)
+//
 package sparse
 
+// TODO(nilium): Need to write up-to-date / correct documentation since this is a renovation of an older package.
+
 import (
-	"bufio"
 	"bytes"
+	"errors"
 	"io"
+	"unicode"
 )
 
-type Handler interface {
-	Comment(comment string) error
-	Enter(key string) error
-	Leave() error
-	Field(key, value string) error
-}
-
 type Parser struct {
-	ReadComments       bool
-	CompressWhitespace bool
-	TrimWhitespace     bool
+	readComments           bool
+	keepSeqWhitespace      bool
+	keepTrailingWhitespace bool
 
-	lastKey string
+	depth int
+	next  parser
+	buf   bytes.Buffer
 }
 
-var DefaultParser = Parser{
-	ReadComments:       false,
-	CompressWhitespace: true,
-	TrimWhitespace:     true,
-}
-
-func Parse(r io.Reader, h Handler) error {
-	parser := DefaultParser
-	return parser.Parse(r, h)
-}
-
-type readFn func(*bufio.Reader, Handler) (readFn, error)
-
-func (p *Parser) comment(comment string, next readFn) readFn {
-	return func(r *bufio.Reader, h Handler) (readFn, error) {
-		var err error
-		if h != nil {
-			err = h.Comment(comment)
-		}
-		return next, err
+func (p *Parser) Reset(configs ...Configuration) {
+	p.buf.Reset()
+	*p = Parser{buf: p.buf}
+	for _, cfg := range configs {
+		cfg.apply(p)
 	}
 }
 
-func (p *Parser) readComment(next readFn) readFn {
-	return func(r *bufio.Reader, h Handler) (readFn, error) {
-		comment, err := r.ReadBytes('\n')
+type bytesReader interface {
+	ReadBytes(delim byte) ([]byte, error)
+}
+
+func readByte(r io.Reader) (byte, error) {
+	if r, ok := r.(io.ByteReader); ok {
+		return r.ReadByte()
+	}
+
+	var rd [1]byte
+	_, err := r.Read(rd[:])
+	return rd[0], err
+}
+
+func readUntil(r io.Reader, delim byte) (seq []byte, err error) {
+	if r, ok := r.(bytesReader); ok {
+		return r.ReadBytes(delim)
+	}
+
+	buf := make([]byte, 0, 16)
+	for err == nil {
+		var b byte
+		if b, err = readByte(r); err == nil {
+			buf = append(buf, b)
+		}
+		if b == delim {
+			break
+		}
+	}
+	return buf, err
+}
+
+func NewParser(configs ...Configuration) *Parser {
+	p := new(Parser)
+	p.Reset(configs...)
+	return p
+}
+
+func Parse(r Reader, configs ...Configuration) (pieces []Piece, err error) {
+	var p Parser
+	p.Reset(configs...)
+
+	for err == nil {
+		var piece Piece
+		piece, err = p.Read(r)
+		if err == nil {
+			pieces = append(pieces, piece)
+		}
+	}
+
+	if err == io.EOF {
+		err = nil
+	}
+
+	return pieces, err
+}
+
+type parser interface {
+	read(Reader) (parser, Piece, error)
+}
+
+type readFn func(Reader) (parser, Piece, error)
+
+func (fn readFn) read(r Reader) (parser, Piece, error) { return fn(r) }
+
+func (p *Parser) comment(comment string, next parser) parser {
+	return readFn(func(r Reader) (parser, Piece, error) {
+		return next, Comment(comment), nil
+	})
+}
+
+func (p *Parser) readComment(next parser) parser {
+	return readFn(func(r Reader) (parser, Piece, error) {
+		comment, err := readUntil(r, '\n')
 		if err == nil {
 			// chomp line ending
 			comment = comment[:len(comment)-1]
@@ -55,55 +148,68 @@ func (p *Parser) readComment(next readFn) readFn {
 		if err != nil && err != io.EOF {
 			// If err isn't nil post-comment read, then nullify the
 			// next read function
-			next = nil
+			next = errReader{err}
 		}
 
-		if p.ReadComments {
-			return p.comment(string(comment), next), err
-		} else {
-			return next, err
+		var piece Piece
+		if p.readComments {
+			piece = Comment(string(comment))
 		}
-	}
+
+		return next, piece, err
+	})
 }
 
-func (p *Parser) readKey(r *bufio.Reader, h Handler) (readFn, error) {
+func (p *Parser) readKey(r Reader) (parser, Piece, error) {
 	c, _, err := r.ReadRune()
 	for (c == ' ' || c == '\t' || c == '\n' || c == '\r') && err == nil {
 		c, _, err = r.ReadRune()
 	}
 
 	if err != nil && err != io.EOF {
-		return nil, err
+		return eofReader, nil, err
 	}
 
 	if c == '}' {
-		return p.leave, err
+		return p.leave()
+	} else if c == '{' {
+		return p.enter("")
 	} else if c == '#' {
-		return p.readComment(p.readKey), err
+		return p.readComment(readFn(p.readKey)), nil, nil
 	}
 
 	var escape bool
 	var last rune
-	var key bytes.Buffer
-	for !(!escape && (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#')) && err == nil {
+	for !(!escape && (c == ' ' || c == '!' || c == ';' || c == '\t' || c == '\n' || c == '\r' || c == '#')) && err == nil {
+		if c == '\r' {
+			goto skipWrite
+		}
+
 		if !escape && c == '\\' {
 			escape = true
 			goto skipWrite
 		} else if escape {
-			if c == 't' {
-				c = '\t'
-			} else if c == 'n' {
-				c = '\n'
-			} else if c == 'r' {
-				c = '\r'
-			} else if c == 'b' {
-				c = '\b'
-			} else if c == 'f' {
-				c = '\f'
-			} else if c == '0' {
-				c = rune(0)
-			} else if c == 'v' {
-				c = '\v'
+			if c == '\n' {
+				if !p.keepSeqWhitespace {
+					chompBuffer(&p.buf)
+				}
+			} else {
+				switch c {
+				case 't':
+					c = '\t'
+				case 'n':
+					c = '\n'
+				case 'r':
+					c = '\r'
+				case 'b':
+					c = '\b'
+				case 'f':
+					c = '\f'
+				case '0':
+					c = rune(0)
+				case 'v':
+					c = '\v'
+				}
 			}
 			escape = false
 			goto skipCompressCheck
@@ -111,83 +217,109 @@ func (p *Parser) readKey(r *bufio.Reader, h Handler) (readFn, error) {
 			goto skipWrite
 		}
 
-		if p.CompressWhitespace && (c == '\t' || c == ' ') && last == c {
+		if !p.keepSeqWhitespace && unicode.IsSpace(last) && unicode.IsSpace(c) {
 			goto skipWrite
 		}
 
 	skipCompressCheck:
 		last = c
-		key.WriteRune(c)
+		p.buf.WriteRune(c)
 	skipWrite:
 		c, _, err = r.ReadRune()
 	}
 
-	if key.Len() == 0 && err != nil {
-		return nil, err
-	} else if err == nil || err == io.EOF {
-		p.lastKey = key.String()
+	key := p.buf.String()
+	p.buf.Reset()
+	if len(key) == 0 && err != nil {
+		if err == io.EOF {
+			return eofReader, nil, err
+		}
+
+		return errReader{err}, nil, err
 	}
 
-	next := p.readValue
+	var next parser
+	var piece Piece
 	if err == io.EOF {
-		next = p.field(p.lastKey, "", nil)
+		next = eofReader
+		piece = Field{key, ""}
 	} else if c == '#' {
 		next = p.readComment(next)
+		piece = Field{key, ""}
+	} else if c == '!' {
+		next = readFn(p.readKey)
+		piece = Field{key, ""}
+	} else {
+		next, piece, err = p.readValue(r, key)
 	}
 
-	return next, err
+	return next, piece, err
 }
 
-func (p *Parser) enter(key string) readFn {
-	return func(r *bufio.Reader, h Handler) (readFn, error) {
-		var err error
-		if h != nil {
-			err = h.Enter(key)
+func (p *Parser) enter(key string) (parser, Piece, error) {
+	out := NodeEnter(key)
+	p.depth++
+	return readFn(p.readKey), out, nil
+}
+
+var ErrUnexpectedNodeLeave = errors.New("sparse: unexpected end of node")
+
+func (p *Parser) leave() (parser, Piece, error) {
+	if p.depth == 0 {
+		return errReader{ErrUnexpectedNodeLeave}, nil, ErrUnexpectedNodeLeave
+	}
+	out := NodeLeave(p.depth)
+	p.depth--
+	return readFn(p.readKey), out, nil
+}
+
+func (p *Parser) field(key, value string, next parser) parser {
+	return readFn(func(r Reader) (parser, Piece, error) {
+		return next, Field{key, value}, nil
+	})
+}
+
+func chompBuffer(b *bytes.Buffer) {
+	n := b.Len()
+	bs := b.Bytes()
+	for ; n > 0; n-- {
+		c := rune(bs[n-1])
+		if c == '\n' || !unicode.IsSpace(rune(bs[n-1])) {
+			break
 		}
-		return p.readKey, err
+	}
+	if b.Len() != n {
+		b.Truncate(n)
 	}
 }
 
-func (p *Parser) leave(r *bufio.Reader, h Handler) (readFn, error) {
-	var err error
-	if h != nil {
-		err = h.Leave()
-	}
-	return p.readKey, err
-}
-
-func (p *Parser) field(key, value string, next readFn) readFn {
-	return func(r *bufio.Reader, h Handler) (readFn, error) {
-		var err error
-		if h != nil {
-			err = h.Field(key, value)
-		}
-		return next, err
-	}
-}
-
-// readValue attempts to read a value from the given bufio Reader and returns
+// readValue attempts to read a value from the given Reader and returns
 // the next read function or an error.
-func (p *Parser) readValue(r *bufio.Reader, h Handler) (readFn, error) {
+func (p *Parser) readValue(r Reader, key string) (parser, Piece, error) {
 	c, _, err := r.ReadRune()
 	for (c == ' ' || c == '\t' || c == '\n' || c == '\r') && err == nil {
 		c, _, err = r.ReadRune()
 	}
 
 	if err != nil && err != io.EOF {
-		return nil, err
+		return errReader{err}, nil, err
 	}
 
 	if c == '{' {
-		return p.enter(p.lastKey), err
+		return p.enter(key)
 	} else if c == '#' {
-		return p.readComment(p.readKey), h.Field(p.lastKey, "")
+		return p.readComment(readFn(p.readKey)), Field{key, ""}, nil
 	}
 
+	defer p.buf.Reset()
 	var escape bool
 	var last rune
-	var value bytes.Buffer
-	for !(!escape && (c == '\n')) && err == nil {
+	for !(!escape && (c == '\n' || c == ';' || c == '#')) && err == nil {
+		if c == '\r' {
+			// Ignore entirely
+			goto skipWrite
+		}
+
 		if !escape {
 			if c == '\\' {
 				escape = true
@@ -196,20 +328,27 @@ func (p *Parser) readValue(r *bufio.Reader, h Handler) (readFn, error) {
 				break
 			}
 		} else if escape {
-			if c == 't' {
-				c = '\t'
-			} else if c == 'n' {
-				c = '\n'
-			} else if c == 'r' {
-				c = '\r'
-			} else if c == 'b' {
-				c = '\b'
-			} else if c == 'f' {
-				c = '\f'
-			} else if c == '0' {
-				c = rune(0)
-			} else if c == 'v' {
-				c = '\v'
+			if c == '\n' {
+				if !p.keepSeqWhitespace {
+					chompBuffer(&p.buf)
+				}
+			} else {
+				switch c {
+				case 't':
+					c = '\t'
+				case 'n':
+					c = '\n'
+				case 'r':
+					c = '\r'
+				case 'b':
+					c = '\b'
+				case 'f':
+					c = '\f'
+				case '0':
+					c = rune(0)
+				case 'v':
+					c = '\v'
+				}
 			}
 			escape = false
 			goto skipCompressCheck
@@ -217,57 +356,55 @@ func (p *Parser) readValue(r *bufio.Reader, h Handler) (readFn, error) {
 			goto skipWrite
 		}
 
-	skipCompressCheck:
-		if p.CompressWhitespace && (c == '\t' || c == ' ') && last == c {
+		if !p.keepSeqWhitespace && unicode.IsSpace(last) && unicode.IsSpace(c) {
 			goto skipWrite
 		}
 
+	skipCompressCheck:
 		last = c
-		value.WriteRune(c)
+		p.buf.WriteRune(c)
 	skipWrite:
 		c, _, err = r.ReadRune()
 	}
 
-	next := p.readKey
+	var next parser = readFn(p.readKey)
 	if err == io.EOF {
-		next = nil
+		next = eofReader
 	} else if c == '#' {
 		next = p.readComment(next)
 	}
 
 	var valueStr string
-	if value.Len() > 0 {
-		if p.TrimWhitespace {
-			valueStr = string(bytes.TrimRight(value.Bytes(), " \n\t\r"))
+	if p.buf.Len() > 0 {
+		if !p.keepTrailingWhitespace {
+			valueStr = string(bytes.TrimRight(p.buf.Bytes(), " \n\t\r"))
 		} else {
-			valueStr = value.String()
+			valueStr = p.buf.String()
 		}
 	}
 
-	return p.field(p.lastKey, valueStr, next), err
+	return next, Field{key, valueStr}, err
 }
 
-// PArse attempts to read a Sparse data file from the given reader. If it
-// succeeds, no error is returned. Otherwise, if either the Handler or another
-// error occurs, that error is returned.
-func (p *Parser) Parse(rd io.Reader, h Handler) error {
-	r := bufio.NewReader(rd)
-	reader := p.readKey
-	var err error
+type eofReaderImpl struct{}
 
-	for reader != nil && err == nil {
-		reader, err = reader(r, h)
+func (r eofReaderImpl) read(Reader) (parser, Piece, error) { return r, nil, io.EOF }
 
-		if err == io.EOF && reader != nil {
-			reader(r, h)
-		}
+var eofReader eofReaderImpl
+
+type errReader struct{ err error }
+
+func (r errReader) read(Reader) (parser, Piece, error) {
+	return r, nil, r.err
+}
+
+func (p *Parser) Read(r Reader) (piece Piece, err error) {
+	if p.next == nil {
+		p.next = readFn(p.readKey)
+	}
+	for p.next != nil && piece == nil && err == nil {
+		p.next, piece, err = p.next.read(r)
 	}
 
-	p.lastKey = ""
-
-	if err == io.EOF {
-		err = nil
-	}
-
-	return err
+	return piece, err
 }
