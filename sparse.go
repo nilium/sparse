@@ -246,7 +246,7 @@ func (p *Parser) readKey(r Reader) (parser, Piece, error) {
 	} else if c == '#' {
 		next = p.readComment(next)
 		piece = Field{key, ""}
-	} else if c == '!' {
+	} else if c == '!' || c == ';' {
 		next = readFn(p.readKey)
 		piece = Field{key, ""}
 	} else {
