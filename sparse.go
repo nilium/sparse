@@ -11,6 +11,10 @@
 //                      blend add
 //              }
 //
+//              next-line-brace
+//              {
+//              }
+//
 //              no-collision!
 //              depth lte
 //              alpha always
@@ -23,13 +27,15 @@
 // Which would yield the following Pieces (either via a Parser or calling Parse):
 //
 //      NodeEnter("textures/base/wall_arc_01")
-//      NodeEnter(" unit")
+//      NodeEnter("") // Unnamed nodes are given the empty key
 //      Comment(" unit") // If ReadComments(true)
 //      Field{"map", "textures/base/wall_arc_01.tga"}
-//      NodeLeave(2)
+//      NodeLeave(2) // The integer value corresponds to node depth
 //      NodeEnter()
 //      Field{"map", "textures/base/wall_arc_01.glow.tga"}
 //      Field{"blend", "add"}
+//      NodeLeave(2)
+//      NodeEnter("next-line-brace") // Names go until they encounter a value, brace, or semicolon.
 //      NodeLeave(2)
 //      Field{"no-collision", ""}
 //      Field{"depth", "lte"}
